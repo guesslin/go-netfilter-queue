@@ -40,6 +40,7 @@ import (
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
+	"golang.org/x/sys/unix"
 )
 
 //Verdict for a packet
@@ -50,8 +51,8 @@ type VerdictContainerC C.verdictContainer
 
 //Container for a verdict and (possibly) a modified packet (Go side)
 type VerdictContainer struct {
-	Verdict	Verdict
-	Packet 	[]byte
+	Verdict Verdict
+	Packet  []byte
 }
 
 type NFPacket struct {
@@ -86,9 +87,6 @@ type NFQueue struct {
 }
 
 const (
-	AF_INET = 2
-	AF_INET6 = 10
-
 	NF_DROP   Verdict = 0
 	NF_ACCEPT Verdict = 1
 	NF_STOLEN Verdict = 2
@@ -114,19 +112,22 @@ func NewNFQueue(queueId uint16, maxPacketsInQueue uint32, packetSize uint32) (*N
 		return nil, fmt.Errorf("Error opening NFQueue handle: %v\n", err)
 	}
 
-	if ret, err = C.nfq_unbind_pf(nfq.h, AF_INET); err != nil || ret < 0 {
-		return nil, fmt.Errorf("Error unbinding existing NFQ handler from AF_INET protocol family: %v\n", err)
-	}
+	// XXX: for kernel version greater than 3.8 won't call nfq_unbind_pf
+	//      but on some kernel 3.10 machine it could cause a failure with "invalid argument"
+	//      so try to disable it.
+	// if ret, err = C.nfq_unbind_pf(nfq.h, unix.AF_INET); err != nil || ret < 0 {
+	// 	return nil, fmt.Errorf("Error unbinding existing NFQ handler from AF_INET protocol family: %v\n", err)
+	// }
 
-	if ret, err = C.nfq_unbind_pf(nfq.h, AF_INET6); err != nil || ret < 0 {
-		return nil, fmt.Errorf("Error unbinding existing NFQ handler from AF_INET6 protocol family: %v\n", err)
-	}
+	// if ret, err = C.nfq_unbind_pf(nfq.h, unix.AF_INET6); err != nil || ret < 0 {
+	// 	return nil, fmt.Errorf("Error unbinding existing NFQ handler from AF_INET6 protocol family: %v\n", err)
+	// }
 
-	if ret, err := C.nfq_bind_pf(nfq.h, AF_INET); err != nil || ret < 0 {
+	if ret, err := C.nfq_bind_pf(nfq.h, unix.AF_INET); err != nil || ret < 0 {
 		return nil, fmt.Errorf("Error binding to AF_INET protocol family: %v\n", err)
 	}
 
-	if ret, err := C.nfq_bind_pf(nfq.h, AF_INET6); err != nil || ret < 0 {
+	if ret, err := C.nfq_bind_pf(nfq.h, unix.AF_INET6); err != nil || ret < 0 {
 		return nil, fmt.Errorf("Error binding to AF_INET6 protocol family: %v\n", err)
 	}
 
@@ -184,11 +185,11 @@ func (nfq *NFQueue) run() {
 }
 
 //export go_callback
-func go_callback(queueId C.int, data *C.uchar, length C.int, idx uint32, vc* VerdictContainerC) {
+func go_callback(queueId C.int, data *C.uchar, length C.int, idx uint32, vc *VerdictContainerC) {
 	xdata := C.GoBytes(unsafe.Pointer(data), length)
 
 	var packet gopacket.Packet
-	if xdata[0] & 0xf0 == ipv4version {
+	if xdata[0]&0xf0 == ipv4version {
 		packet = gopacket.NewPacket(xdata, layers.LayerTypeIPv4, gopacket.DecodeOptions{Lazy: true, NoCopy: true})
 	} else {
 		packet = gopacket.NewPacket(xdata, layers.LayerTypeIPv6, gopacket.DecodeOptions{Lazy: true, NoCopy: true})
@@ -196,7 +197,7 @@ func go_callback(queueId C.int, data *C.uchar, length C.int, idx uint32, vc* Ver
 
 	p := NFPacket{
 		verdictChannel: make(chan VerdictContainer),
-		Packet: packet,
+		Packet:         packet,
 	}
 
 	theTabeLock.RLock()
@@ -209,24 +210,24 @@ func go_callback(queueId C.int, data *C.uchar, length C.int, idx uint32, vc* Ver
 		(*vc).length = 0
 	}
 	select {
-		case *cb <- p:
-			select {
-				case v := <-p.verdictChannel:
-					if v.Packet == nil {
-						(*vc).verdict = C.uint(v.Verdict)
-						(*vc).data = nil
-						(*vc).length = 0
-					} else {
-						(*vc).verdict = C.uint(v.Verdict)
-						(*vc).data = (*C.uchar)(unsafe.Pointer(&v.Packet[0]))
-						(*vc).length = C.uint(len(v.Packet))
-					}
+	case *cb <- p:
+		select {
+		case v := <-p.verdictChannel:
+			if v.Packet == nil {
+				(*vc).verdict = C.uint(v.Verdict)
+				(*vc).data = nil
+				(*vc).length = 0
+			} else {
+				(*vc).verdict = C.uint(v.Verdict)
+				(*vc).data = (*C.uchar)(unsafe.Pointer(&v.Packet[0]))
+				(*vc).length = C.uint(len(v.Packet))
 			}
+		}
 
-		default:
-			fmt.Fprintf(os.Stderr, "Dropping, unexpectedly due to no recv, idx=%d\n", idx)
-			(*vc).verdict = C.uint(NF_DROP)
-			(*vc).data = nil
-			(*vc).length = 0
+	default:
+		fmt.Fprintf(os.Stderr, "Dropping, unexpectedly due to no recv, idx=%d\n", idx)
+		(*vc).verdict = C.uint(NF_DROP)
+		(*vc).data = nil
+		(*vc).length = 0
 	}
 }
